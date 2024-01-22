@@ -1,0 +1,480 @@
+# -*- coding: utf-8 -*-
+
+import os
+import re
+
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+class DataCleaning:
+    def __init__(self):
+        # Set the similarity threshold
+        self.similarity_threshold = 0.7
+        self.file_path_3 = 'config/modified_poi-extract-2018_03_02.csv'
+        self.file_path_dedup_3 = 'config/modified_poi-extract-2018_03_dedup.csv'
+        self.file_path_6 = 'config/modified_poi-extract-2018_06_02.csv'
+        self.file_path_dedup_6 = 'config/modified_poi-extract-2018_06_dedup.csv'
+        self.file_path_postcode_both = 'config/postcode_both.csv'
+        self.file_path_postcode_only_6 = 'config/postcode_only_6.csv'
+        self.file_path_poi = 'config/merged_modified_poi_data.csv'
+        self.file_path_cleaned_poi = 'config/cleaned_merged_modified_poi_data.csv'
+        self.file_path_removed_poi = 'config/ref_no_to_remove.csv'
+        self.poi_split_prefix = 'merged_modified_poi_data_part_'
+        self.poi_split_folder = 'config/poi_split/'
+
+        self.chunk_size = 500000
+        self.removed_column = ['ref_no', 'name', 'pointx_class', 'feature_easting', 'feature_northing',
+                               'address_detail', 'street_name', 'locality', 'geographic_county', 'postcode',
+                               'verified_address', 'admin_boundary', 'brand', 'provenance', 'postal_area', 'year',
+                               'month', 'merged_data_row']
+        self.cleaned_column = ['ref_no', 'name', 'pointx_class', 'feature_easting', 'feature_northing',
+                               'address_detail', 'street_name', 'locality', 'geographic_county', 'postcode',
+                               'verified_address', 'admin_boundary', 'brand', 'provenance', 'postal_area', 'year',
+                               'month']
+
+        self.data_remove_by_interval = []
+        self.data_similar_dict = {}
+        self.data_similar_list = []
+        self.data_similar_march = []
+        self.data_similar_june = []
+        self.data_dissimilar_list = set()
+        self.data_need_to_remove = pd.DataFrame()
+        self.data_need_to_save = pd.DataFrame()
+
+    def add_remove_data(self, df_data):
+        self.data_need_to_remove = pd.concat([self.data_need_to_remove, df_data], ignore_index=True)
+        self.data_need_to_remove = self.data_need_to_remove.round(1)
+
+    def add_save_data(self, df_data):
+        self.data_need_to_save = pd.concat([self.data_need_to_save, df_data], ignore_index=True)
+
+    # Process the 'address_detail' column that contains '-', splitting it into multiple rows
+    @staticmethod
+    def expand_rows(origin_index, row):
+        rows = []
+        if pd.notna(row['address_detail']) and isinstance(row['address_detail'], str):
+            if '-' in row['address_detail']:
+                parts = row['address_detail'].split('-')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    a, b = map(int, parts)
+                    for i in range(a, b + 1):
+                        new_row = row.copy()
+                        new_row['address_detail'] = str(i)
+                        new_row['original_row'] = int(origin_index)
+                        rows.append(new_row)
+            else:
+                rows.append(row)
+        else:
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def address_merge(address_detail, street_name):
+        return address_detail + ' ' + street_name
+
+    @staticmethod
+    def deduplication_postcode(file_path_original, file_path_dedup):
+        df = pd.read_csv(file_path_original)
+
+        # Deduplicate the "postcode" column
+        df_unique_postcodes = df.drop_duplicates(subset=['postcode'])
+        # Write the deduplicated data to a new CSV file
+        df_unique_postcodes.to_csv(file_path_dedup, index=False)
+
+    def split_poi_data_v2(self, ref_no_postcode_cor):
+
+        df = pd.read_csv(self.file_path_poi)
+        # Calculate the total number of chunks
+        num_chunks = len(ref_no_postcode_cor) // self.chunk_size + 1
+
+        ref_no_lists = []
+
+        # Iterate through each chunk
+        for i in range(num_chunks):
+            start_idx = i * self.chunk_size
+            end_idx = (i + 1) * self.chunk_size
+            chunk = ref_no_postcode_cor.iloc[start_idx:end_idx]
+            # Use the exploded function to expand the list
+            df_exploded = chunk.explode('ref_no')
+            # Convert the expanded list into a new list
+            merged_ref_list = df_exploded['ref_no'].tolist()
+            ref_no_lists.append(merged_ref_list)
+
+        index = 0
+        for ref_no_list in ref_no_lists:
+            filtered_df = df[df['ref_no'].isin(ref_no_list)]
+            filtered_df['merged_data_row'] = df[df['ref_no'].isin(ref_no_list)].index
+            output_file = self.poi_split_folder + \
+                          f'{self.poi_split_prefix}{index + 1}.csv'
+            index += 1
+            filtered_df.to_csv(output_file, index=False)
+        print('Splitting complete.')
+
+    @staticmethod
+    def calculate_similarity(str1, str2):
+        try:
+            vector = CountVectorizer().fit_transform([str1, str2])
+            vectors = vector.toarray()
+            cosine_sim = cosine_similarity(vectors)
+            similarity = cosine_sim[0][1]
+            return similarity
+        except ValueError:
+            return 1
+
+    @staticmethod
+    def expand_address(address_combined):
+        if '-' in address_combined[0] and address_combined[0].split('-')[1].isdigit():
+            detail_without_letter = ''.join(char for char in address_combined[0] if char.isnumeric() or char == '-')
+            address_detail = [i for i in
+                              range(int(detail_without_letter.split('-')[0]), int(detail_without_letter.split('-')[1]))]
+        else:
+            detail_without_letter = ''.join(char for char in address_combined[0] if char.isnumeric())
+            address_detail = [detail_without_letter]
+        address_str = ' '.join(address_combined[1:])
+        return address_detail, address_str
+
+    def check_time_interval_by_ref(self, ref_nums, df_poi):
+        result_tmp = []
+        # con_1, con_2, con_3 = self.gen_condition(df_poi)
+        # for ref_num in ref_nums:
+        #     poi_data = df_poi[df_poi['ref_no'] == ref_num]
+        #     check_time_interval = poi_data.loc[~con_1 & ~con_2 & ~con_3]
+        #     if check_time_interval.empty:
+        #         data_need_to_remove.append(ref_num)
+        for value in ref_nums:
+            filtered_df = df_poi[df_poi['ref_no'] == str(value)]
+            # Check the year and month of the first and last rows respectively
+            if not filtered_df.empty:
+                if int(filtered_df.iloc[0]['year']) >= 2018 and int(filtered_df.iloc[0]['month']) >= 6:
+                    if int(filtered_df.iloc[-1]['year']) <= 2020 and int(filtered_df.iloc[-1]['month']) <= 6:
+                        result_tmp.append(value)
+        return result_tmp
+
+    @staticmethod
+    def gen_condition(df_poi):
+        condition_one = (df_poi['year'].astype(int) >= 2018) & (df_poi['year'].astype(int) <= 2020)
+        condition_two = (df_poi['year'].astype(int) > 2018) | (df_poi['month'].astype(int) >= 6)
+        condition_three = (df_poi['year'].astype(int) < 2020) | (df_poi['month'].astype(int) <= 6)
+        return condition_one, condition_two, condition_three
+
+    def filter_data_by_similar_address(self, df_poi):
+        # for ref_index, ref_value in enumerate(self.data_need_to_check_due_to_similar_list):
+        for ref_index, ref_value in enumerate(self.data_similar_list):
+            ref_3 = ref_value.split('_')[1]
+            ref_6 = ref_value.split('_')[0]
+            poi_data_3 = df_poi[df_poi['ref_no'] == ref_3]
+            poi_data_6 = df_poi[df_poi['ref_no'] == ref_6]
+            poi_data_3['date'] = (poi_data_3['year'].fillna('').astype(str) + '-' +
+                                  poi_data_3['month'].fillna('').astype(str))
+            poi_data_3['origin_row'] = poi_data_3.index.astype(int)
+            poi_data_6['date'] = (poi_data_6['year'].fillna('').astype(str) + '-' +
+                                  poi_data_6['month'].fillna('').astype(str))
+            poi_data_6['origin_row'] = poi_data_6.index.astype(int)
+            merge_poi_data_by_date = pd.merge(poi_data_3, poi_data_6, on='date', how='inner')
+            self.add_data_need_to_remove(merge_poi_data_by_date, poi_data_3, poi_data_6)
+            
+    def add_data_need_to_remove(self, merge_poi_data_by_date, poi_data_3, poi_data_6):
+        if not merge_poi_data_by_date.empty:
+            poi_data_3_copy = poi_data_3.copy()
+            poi_data_6_copy = poi_data_6.copy()
+            poi_data_3_copy.sort_values(by=['year', 'month'], ascending=[True, True], inplace=True)
+            poi_data_6_copy.sort_values(by=['year', 'month'], ascending=[True, True], inplace=True)
+            if int(poi_data_3_copy.iloc[0]['year']) < int(poi_data_6_copy.iloc[0]['year']):
+                data_need_to_remove_by_similar = poi_data_3_copy.loc[merge_poi_data_by_date['origin_row_x']]
+                self.add_remove_data(data_need_to_remove_by_similar)
+            elif int(poi_data_3_copy.iloc[0]['year']) > int(poi_data_6_copy.iloc[0]['year']):
+                data_need_to_remove_by_similar = poi_data_6_copy.loc[merge_poi_data_by_date['origin_row_y']]
+                self.add_remove_data(data_need_to_remove_by_similar)
+            else:
+                if int(poi_data_3_copy.iloc[0]['month']) < int(poi_data_6_copy.iloc[0]['month']):
+                    data_need_to_remove_by_similar = poi_data_3_copy.loc[merge_poi_data_by_date['origin_row_x']]
+                    self.add_remove_data(data_need_to_remove_by_similar)
+                elif int(poi_data_3_copy.iloc[0]['month']) > int(poi_data_6_copy.iloc[0]['month']):
+                    data_need_to_remove_by_similar = poi_data_6_copy.loc[merge_poi_data_by_date['origin_row_y']]
+                    self.add_remove_data(data_need_to_remove_by_similar)
+                else:
+                    count_poi_data_3 = len(poi_data_3_copy)
+                    count_poi_data_6 = len(poi_data_6_copy)
+                    if count_poi_data_3 > count_poi_data_6:
+                        data_need_to_remove_by_similar = poi_data_6_copy.loc[merge_poi_data_by_date['origin_row_y']]
+                        self.add_remove_data(data_need_to_remove_by_similar)
+                    else:
+                        data_need_to_remove_by_similar = poi_data_3_copy.loc[merge_poi_data_by_date['origin_row_x']]
+                        self.add_remove_data(data_need_to_remove_by_similar)
+
+    def get_ref_nums_need_to_check_v2(self, postcodes):
+        for postcode in postcodes['postcode']:
+            # Calculate the occurrence count of this postcode in the two files
+            postcodes_march_count = poi_extract_3[poi_extract_3['postcode'] == postcode]
+            postcodes_march = expanded_df_march[expanded_df_march['postcode'] == postcode]
+            postcodes_june_count = poi_extract_6[poi_extract_6['postcode'] == postcode]
+            postcodes_june = expanded_df_june[expanded_df_june['postcode'] == postcode]
+            count_3 = len(postcodes_march_count)
+            count_6 = len(postcodes_june_count)
+            # If the count in March is greater than the count in June, then print the corresponding data
+            if count_3 < count_6:
+                for row_index_3, row_content_3 in postcodes_march.iterrows():
+                    address_combined_3 = row_content_3['combined'].split(' ')
+                    if address_combined_3[0] == '':
+                        self.add_data_to_dissimilar(postcodes_june, row_content_3)
+                        continue
+                    if not address_combined_3[0][0].isdigit():
+                        self.add_data_to_dissimilar(postcodes_june, row_content_3)
+                        continue
+                    address_detail_3, address_nums_3 = self.split_address(address_combined_3)
+                    for row_index_6, row_content_6 in postcodes_june.iterrows():
+                        address_combined_6 = row_content_6['combined'].split(' ')
+                        if address_combined_6[0] == '':
+                            self.data_dissimilar_list.add(int(row_content_3['ref_no']))
+                            self.data_dissimilar_list.add(int(row_content_6['ref_no']))
+                            continue
+                        if address_combined_6[0][0].isdigit():
+                            address_detail_6, address_nums_6 = self.split_address(address_combined_6)
+                            self.classify_data(self.data_similar_list, address_detail_3, address_detail_6,
+                                               address_nums_3, address_nums_6, row_content_3, row_content_6)
+                            # Use an inner loop to check the similarity of addresses in June
+                            for inner_index_june, inner_content_june in postcodes_june.loc[row_index_6 + 1:].iterrows():
+                                inner_address_combined_6 = inner_content_june['combined'].split(' ')
+                                if inner_address_combined_6[0] == '':
+                                    self.data_dissimilar_list.add(int(row_content_6['ref_no']))
+                                    continue
+                                if inner_address_combined_6[0][0].isdigit():
+                                    inner_address_detail_6, inner_address_nums_6 = self.split_address(
+                                        inner_address_combined_6)
+                                    self.classify_data(self.data_similar_list, address_detail_6, inner_address_detail_6,
+                                                       address_nums_6, inner_address_nums_6, inner_content_june,
+                                                       row_content_6)
+                        else:
+                            self.data_dissimilar_list.add(int(row_content_3['ref_no']))
+                            self.data_dissimilar_list.add(int(row_content_6['ref_no']))
+                    for inner_index_march, inner_content_march in postcodes_march.loc[row_index_3 + 1:].iterrows():
+                        inner_address_combined_march = inner_content_march['combined'].split(' ')
+                        if inner_address_combined_march[0] == '':
+                            self.data_dissimilar_list.add(int(row_content_3['ref_no']))
+                            continue
+                        if inner_address_combined_march[0][0].isdigit():
+                            inner_address_detail_march, inner_address_nums_march = self.split_address(
+                                inner_address_combined_march)
+                            self.classify_data(self.data_similar_march, address_detail_3, inner_address_detail_march,
+                                               address_nums_3, inner_address_nums_march, inner_content_march,
+                                               row_content_3)
+
+    def add_data_to_dissimilar(self, postcodes_june, row_content_3):
+        self.data_dissimilar_list.add(
+            int(row_content_3['ref_no']))
+        for row_index_6, row_content_6 in postcodes_june.iterrows():
+            self.data_dissimilar_list.add(
+                int(row_content_6['ref_no']))
+
+    @staticmethod
+    def split_address(address_combined):
+        address_num = address_combined[0]
+        address_detail = ' '.join(address_combined[1:])
+        return address_detail, address_num
+
+    @staticmethod
+    def get_address_num(str_value):
+        return re.sub(r'\D', '', str_value)
+
+    def classify_data(self, similar_list, address_detail_left, address_detail_right, address_nums_left,
+                      address_nums_right, row_content_left, row_content_right):
+        address_nums_left = self.get_address_num(address_nums_left)
+        address_nums_right = self.get_address_num(address_nums_right)
+
+        if address_nums_left == address_nums_right:
+            # Calculate similarity
+            similarity = dc.calculate_similarity(
+                address_detail_left, address_detail_right)
+            if (similarity >= dc.similarity_threshold and
+                    (int(row_content_right['ref_no']) != int(row_content_left['ref_no']))):
+                similar_list.append(
+                    str(int(row_content_right['ref_no'])) + '_' + str(
+                        int(row_content_left['ref_no'])))
+            else:
+                self.data_dissimilar_list.add(
+                    int(row_content_left['ref_no']))
+                self.data_dissimilar_list.add(
+                    int(row_content_right['ref_no']))
+        else:
+            self.data_dissimilar_list.add(
+                int(row_content_left['ref_no']))
+            self.data_dissimilar_list.add(
+                int(row_content_right['ref_no']))
+
+    @staticmethod
+    def get_ref_no_postcode_cor(df_march, df_june):
+        df_3_postcode_ref_no_3 = df_march.groupby('postcode')['ref_no'].agg(list).reset_index()
+        df_6_postcode_ref_no_6 = df_june.groupby('postcode')['ref_no'].agg(list).reset_index()
+        merge_postcode_ref_no = pd.concat([df_3_postcode_ref_no_3, df_6_postcode_ref_no_6])
+
+        # Merge two DataFrames using how='outer' for an outer join
+        merged_df = pd.merge(merge_postcode_ref_no, df_3_postcode_ref_no_3, on='postcode', how='outer',
+                             suffixes=('_merged', '_3'))
+
+        # Find the rows in df_3_postcode_ref_no_3 that are not in merge_postcode_ref_no
+        not_in_merge_3 = merged_df[merged_df['ref_no_3'].isnull()]
+
+        # Following the same steps, find the rows in df_6_postcode_ref_no_6 that are not in merge_postcode_ref_no
+        merged_df = pd.merge(merge_postcode_ref_no, df_6_postcode_ref_no_6, on='postcode', how='outer',
+                             suffixes=('_merged', '_6'))
+        not_in_merge_6 = merged_df[merged_df['ref_no_6'].isnull()]
+
+        result_neither_march_nor_june = pd.concat([not_in_merge_3, not_in_merge_6]).reset_index(drop=True)
+
+        result_both = merge_postcode_ref_no.groupby('postcode')['ref_no'].agg(sum).agg(set).agg(list).reset_index()
+        return result_both
+
+    @staticmethod
+    def process_address_detail(value):
+        if isinstance(value, str):
+            return value
+        try:
+            return str(int(value))
+        except (ValueError, TypeError):
+            return ''
+
+    @staticmethod
+    def convert_str_to_int(str_list):
+        return [int(num) for num in str_list]
+
+    @staticmethod
+    def check_need_to_remove(ref_no_list, df):
+        # Query the ref_no in ref_no_only_in_6
+
+        result = []
+        for value in ref_no_list:
+            filtered_df = df[df['ref_no'] == str(value)]
+            # Check the year and month of the first and last rows respectively
+            if not filtered_df.empty:
+                if int(filtered_df.iloc[0]['year']) >= 2018 and int(filtered_df.iloc[0]['month']) >= 6:
+                    if int(filtered_df.iloc[-1]['year']) <= 2020 and int(filtered_df.iloc[-1]['month']) <= 6:
+                        result.append(value)
+        return result
+
+
+if __name__ == '__main__':
+    dc = DataCleaning()
+    # Initial operation, file splitting required to reduce memory usage, set this value to True when splitting is needed
+    need_split_file = True
+
+    if need_split_file:
+        # 1. Read the CSV file for March, extract the 'postcode' column, remove duplicates, and then write it to a temporary file.
+        dc.deduplication_postcode(dc.file_path_3, dc.file_path_dedup_3)
+        # 2. Read the CSV file for June, extract the 'postcode' column, remove duplicates, and then write it to a temporary file.
+        dc.deduplication_postcode(dc.file_path_6, dc.file_path_dedup_6)
+        # 3. Read the temporary file for June, check if it exists in March, if it does, write it to the temporary file 'file_path_postcode_both', otherwise, write that row to the intermediate file 'file_path_postcode_only_6'
+        df_3 = pd.read_csv(dc.file_path_3)
+        df_6 = pd.read_csv(dc.file_path_6)
+        merged_postcode_ref_no = dc.get_ref_no_postcode_cor(df_3, df_6)
+
+        # Based on whether the data in the 'postcode' column of file A exists in file B, divide the data into two parts: existing and non-existing
+        exists_in_3 = df_6[df_6['postcode'].isin(df_3['postcode'])].drop_duplicates(subset='postcode')
+        not_exists_in_3 = df_6[~df_6['postcode'].isin(df_3['postcode'])]
+        # Write the existing data to the 'file_path_postcode_both' file.
+        exists_in_3.to_csv(dc.file_path_postcode_both, index=False)
+        print(f"Data existing in B saved to {dc.file_path_postcode_both}")
+        # Write the non-existing data to the 'file_path_postcode_only_6' file
+        not_exists_in_3.to_csv(dc.file_path_postcode_only_6, index=False)
+        print(f"Data not existing in B saved to {dc.file_path_postcode_only_6}")
+        # 4. Split the 'poi_data' file into multiple files, each containing 10,000 lines.
+        dc.split_poi_data_v2(merged_postcode_ref_no)
+    # print(f"Splitting the table takes time：{time.time() - start}")
+    postcode_only_6 = pd.read_csv(dc.file_path_postcode_only_6)
+    postcode_both = pd.read_csv(dc.file_path_postcode_both)
+    poi_extract_3 = pd.read_csv(dc.file_path_3)
+    poi_extract_3_copy = poi_extract_3.copy()
+    expanded_rows_march = []
+    expanded_rows_june = []
+    for index, row in poi_extract_3_copy.iterrows():
+        expanded_rows_march.extend(dc.expand_rows(index, row))
+    expanded_df_march = pd.DataFrame(expanded_rows_march)
+    poi_extract_6 = pd.read_csv(dc.file_path_6)
+    poi_extract_6_copy = poi_extract_6.copy()
+    for index, row in poi_extract_6_copy.iterrows():
+        expanded_rows_june.extend(dc.expand_rows(index, row))
+    expanded_df_june = pd.DataFrame(expanded_rows_june)
+    expanded_df_march['ref_no'] = expanded_df_march['ref_no'].apply(dc.process_address_detail)
+    expanded_df_march['address_detail'] = expanded_df_march['address_detail'].apply(dc.process_address_detail)
+    expanded_df_march['origin_row'] = expanded_df_march.index.astype(int)
+    expanded_df_june['ref_no'] = expanded_df_june['ref_no'].apply(dc.process_address_detail)
+    expanded_df_june['address_detail'] = expanded_df_june['address_detail'].apply(dc.process_address_detail)
+    expanded_df_march['combined'] = (expanded_df_march['address_detail'].fillna('').astype(str) +
+                                     ' ' +
+                                     expanded_df_march['street_name'].fillna('').astype(str))
+    expanded_df_june['combined'] = (expanded_df_june['address_detail'].fillna('').astype(str) +
+                                    ' ' +
+                                    expanded_df_june['street_name'].fillna('').astype(str))
+    expanded_df_june['origin_row'] = expanded_df_june.index.astype(int)
+
+    # Separately save similar and dissimilar ref data
+    dc.get_ref_nums_need_to_check_v2(postcode_both)
+    # print(f"Calculate similarity takes time：{time.time() - start}")
+    # 5. Read and validate ref_no from the intermediate file file_path_postcode_only_6, iterate through the files in poi_split, and if it only exists in files from June 2018 to June 2020, then delete that row
+    csv_split_files = [f for f in os.listdir(
+        dc.poi_split_folder) if f.endswith('.csv')]
+
+    need_write_column = True
+    for csv_file in csv_split_files:
+        print(f"The current processing file:{csv_file}")
+        dc.data_need_to_remove = pd.DataFrame()
+        df_split_csv = pd.read_csv(dc.poi_split_folder + csv_file)
+        df_split_csv_copy = df_split_csv.copy()
+        df_split_csv_copy['ref_no'] = df_split_csv_copy['ref_no'].apply(dc.process_address_detail)
+        df_split_csv_copy['year'] = df_split_csv_copy['year'].apply(dc.process_address_detail)
+        df_split_csv_copy['month'] = df_split_csv_copy['month'].apply(dc.process_address_detail)
+        df_split_csv_copy['origin_row'] = df_split_csv_copy.index.astype(int)
+        df_split_csv_copy = df_split_csv_copy.dropna(how="all")
+        # Defining the filtering criteria
+        condition_1, condition_2, condition_3 = dc.gen_condition(df_split_csv_copy)
+        # Data within 2018 to 2020
+        filtered_data_between_2018_2020 = df_split_csv_copy[condition_1 & condition_2 & condition_3]
+        # Data not within 2018 to 2020
+        filtered_data_other_data = df_split_csv_copy[~(condition_1 | condition_2 | condition_3)]
+        # Read ref_no only exit in June, save the data into the file
+        ref_no_only_in_6 = postcode_only_6['ref_no']
+        print(sorted(ref_no_only_in_6.to_list()))
+        ref_no_only_in_6_need_removed = dc.check_need_to_remove(ref_no_only_in_6.to_list(), df_split_csv_copy)
+        print(sorted(ref_no_only_in_6_need_removed))
+        data_need_to_remove_condition = filtered_data_between_2018_2020['ref_no'].astype(int).isin(
+            ref_no_only_in_6_need_removed)
+        data_need_to_remove = filtered_data_between_2018_2020[data_need_to_remove_condition]
+        dc.add_remove_data(data_need_to_remove)
+        # 7. If there are records in both March and June, record the ref_no, check the occurrence time of ref in poi_data, and delete duplicate records with the earlier ref_no
+        dc.filter_data_by_similar_address(df_split_csv_copy)
+
+        # 8. Check the occurrence time of ref_no in poi_data. If it exists only between June 2018 and June 2020, then delete all records of that ref_no
+        ref_nums_need_to_check_by_interval = dc.check_time_interval_by_ref(list(dc.data_dissimilar_list),
+                                                                           df_split_csv_copy)
+        data_need_to_remove = filtered_data_between_2018_2020[filtered_data_between_2018_2020['ref_no'].astype(int).isin(
+            ref_nums_need_to_check_by_interval)]
+        dc.add_remove_data(data_need_to_remove)
+        dc.data_need_to_remove.drop_duplicates(subset='origin_row', inplace=True)
+        # df_split_csv_copy.drop(dc.data_need_to_remove['origin_row'], inplace=True)
+        try:
+            dc.data_need_to_remove.drop(['date', 'origin_row'], axis=1, inplace=True)
+        except KeyError:
+            dc.data_need_to_remove.drop(['origin_row'], axis=1, inplace=True)
+        # Write the rows deleted from poi_data to ref_no_to_remove.csv
+        if need_write_column:
+            dc.data_need_to_remove.to_csv(dc.file_path_removed_poi, index=False, mode='a', header=True,
+                                          columns=dc.removed_column)
+            need_write_column = False
+        else:
+            dc.data_need_to_remove.to_csv(dc.file_path_removed_poi, index=False, mode='a', header=False)
+    removed_file = pd.read_csv(dc.file_path_removed_poi)
+    removed_file.drop_duplicates(subset='merged_data_row', inplace=True)
+    removed_condition = removed_file['merged_data_row'].to_list()
+    removed_file.drop(['merged_data_row'], axis=1, inplace=True)
+    removed_file.to_csv(dc.file_path_removed_poi)
+    try:
+        removed_condition = [int(num) for num in removed_condition]
+    except Exception:
+        removed_condition = [int(num) for num in removed_condition if num.isdigit()]
+    merge_poi_data = pd.read_csv(dc.file_path_poi)
+    cleaned_merged_poi_data = merge_poi_data[~merge_poi_data.index.isin(removed_condition)]
+    # You can use reset_index if you want to reset the index
+    cleaned_merged_poi_data.reset_index(drop=True, inplace=True)
+    cleaned_merged_poi_data.to_csv(dc.file_path_cleaned_poi, index=False, mode='a', header=True,
+                                   columns=dc.cleaned_column)
